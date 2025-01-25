@@ -1,6 +1,6 @@
 import type React from "react"
 import { Volume2, VolumeX } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import { Button } from "../components/ui/button"
 
 interface SoundSettingsProps {
   isMuted: boolean

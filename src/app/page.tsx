@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react"
 import { motion, AnimatePresence, useSpring } from "framer-motion"
-import { Button } from "@/components/ui/button"
+import { Button } from "../components/ui/button"
 import { PauseIcon, PlayIcon } from "lucide-react"
 import { useSound } from "use-sound"
 import {
