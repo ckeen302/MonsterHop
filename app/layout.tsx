@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next'
+import { fredoka } from '../src/lib/fonts'
 import './globals.css'
 
 export const metadata: Metadata = {
@@ -11,6 +12,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  themeColor: '#120d2e',
 }
 
 export default function RootLayout({
@@ -19,8 +21,8 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="en" className={fredoka.variable}>
+      <body className={fredoka.className}>{children}</body>
     </html>
   )
 }

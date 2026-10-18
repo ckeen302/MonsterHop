@@ -7,6 +7,7 @@ import type {
   AvatarId,
   BlackHole,
   GameState,
+  Gem,
   MonsterEntity,
   MonsterKind,
   Platform,
@@ -14,6 +15,7 @@ import type {
   World,
 } from "../types/game"
 import { useSoundEffects } from "../hooks/useSoundEffects"
+import { GAME_FONT } from "../lib/fonts"
 
 // ---------------------------------------------------------------------------
 // Tuning constants (units: px and seconds, y grows downward like the canvas)
@@ -42,6 +44,27 @@ const SUCK_DURATION = 0.7
 const HUD_H = 44
 const HIGH_SCORE_KEY = "monsterhop-highscore"
 const MUTED_KEY = "monsterhop-muted"
+// Score now includes kill/gem bonuses, so the BEST altitude line needs its
+// own record of the highest climb rather than deriving it from the score.
+const BEST_HEIGHT_KEY = "monsterhop-bestheight"
+const GEM_SIZE = 20
+const KILL_POINTS = 100
+const GEM_POINTS = 25
+// The starting ground sits this far below the screen bottom minus the pad
+const GROUND_OFFSET = 60
+
+const ZONES = [
+  { at: 0, name: "Dusk Meadow" },
+  { at: 6000, name: "Twilight Drift" },
+  { at: 14000, name: "Starfield" },
+  { at: 28000, name: "Deep Space" },
+  { at: 42000, name: "The Void" },
+]
+const zoneIndex = (climb: number) => {
+  let i = 0
+  while (i < ZONES.length - 1 && climb >= ZONES[i + 1].at) i++
+  return i
+}
 
 let idCounter = 0
 const nextId = () => ++idCounter
@@ -132,6 +155,7 @@ const makePlatform = (x: number, y: number, kind: PlatformKind, width: number): 
   attachSide: Math.random() < 0.5 ? -1 : 1,
   sprungAt: 0,
   fadingAt: 0,
+  landedAt: 0,
 })
 
 const attachAnchorX = (p: Platform) => (p.attachSide < 0 ? p.x + 7 : p.x + PLATFORM_W - 27)
@@ -219,6 +243,22 @@ const spawnRow = (w: World, width: number) => {
     }
   }
 
+  // Gems: occasional floating collectibles, sometimes strung in a little arc
+  if (Math.random() < 0.09) {
+    const count = Math.random() < 0.35 ? 3 + Math.floor(Math.random() * 3) : 1
+    const gx = x + PLATFORM_W / 2 + (Math.random() - 0.5) * 160
+    const gy = w.nextSpawnY - spacing * 0.5
+    for (let i = 0; i < count; i++) {
+      const t = count === 1 ? 0 : i / (count - 1) - 0.5
+      w.gems.push({
+        id: nextId(),
+        x: clamp(gx + t * 100 - GEM_SIZE / 2, 4, width - GEM_SIZE - 4),
+        y: gy - Math.cos(t * Math.PI) * 28,
+        phase: Math.random() * Math.PI * 2,
+      })
+    }
+  }
+
   w.nextSpawnY -= spacing
 }
 
@@ -243,17 +283,26 @@ const createWorld = (width: number, height: number): World => {
     enemyShots: [],
     shards: [],
     particles: [],
+    gems: [],
+    popups: [],
     time: 0,
     nextSpawnY: height - 90,
     lastMainX: width / 2 - PLATFORM_W / 2,
     totalClimb: 0,
     score: 0,
+    bonus: 0,
     kills: 0,
+    gemsCollected: 0,
+    stompChain: 0,
+    zone: 0,
+    zoneBannerAt: -10,
     fellAt: 0,
     suckedAt: 0,
     suckX: 0,
     suckY: 0,
     shakeUntil: 0,
+    shakeMag: 0,
+    flashUntil: 0,
   }
   // Guaranteed launch pad under the player, then easy rows up the screen.
   // The ladder wanders (rather than teleporting) horizontally, and wide
@@ -301,6 +350,20 @@ const addParticles = (w: World, x: number, y: number, count: number, color: stri
   }
 }
 
+const addPopup = (w: World, x: number, y: number, text: string, color: string) => {
+  if (w.popups.length > 20) w.popups.shift()
+  w.popups.push({ x, y, text, color, life: 0.9 })
+}
+
+const shake = (w: World, duration: number, magnitude: number) => {
+  // A small shake never weakens or shortens a bigger one already playing
+  const active = w.time < w.shakeUntil
+  w.shakeMag = active ? Math.max(w.shakeMag, magnitude) : magnitude
+  w.shakeUntil = Math.max(w.shakeUntil, w.time + duration)
+}
+
+const groundY = (w: World, height: number) => height - GROUND_OFFSET + w.totalClimb
+
 const breakPlatform = (w: World, p: Platform) => {
   w.platforms = w.platforms.filter((pl) => pl.id !== p.id)
   for (const flip of [false, true]) {
@@ -330,19 +393,27 @@ const rr = (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: n
   ctx.closePath()
 }
 
-const PLATFORM_STYLE: Record<PlatformKind, { fill: string; stroke: string; glow: string }> = {
-  green: { fill: "#4ade80", stroke: "#15803d", glow: "rgba(74,222,128,0.55)" },
-  moving: { fill: "#38bdf8", stroke: "#0369a1", glow: "rgba(56,189,248,0.55)" },
-  breakable: { fill: "#fb923c", stroke: "#9a3412", glow: "rgba(251,146,60,0.5)" },
-  ghost: { fill: "rgba(255,255,255,0.16)", stroke: "rgba(255,255,255,0.7)", glow: "rgba(255,255,255,0.35)" },
+const PLATFORM_STYLE: Record<PlatformKind, { top: string; fill: string; stroke: string; glow: string }> = {
+  green: { top: "#86efac", fill: "#22c55e", stroke: "#15803d", glow: "rgba(74,222,128,0.55)" },
+  moving: { top: "#7dd3fc", fill: "#0ea5e9", stroke: "#0369a1", glow: "rgba(56,189,248,0.55)" },
+  breakable: { top: "#fdba74", fill: "#f97316", stroke: "#9a3412", glow: "rgba(251,146,60,0.5)" },
+  ghost: {
+    top: "rgba(255,255,255,0.32)",
+    fill: "rgba(255,255,255,0.1)",
+    stroke: "rgba(255,255,255,0.75)",
+    glow: "rgba(255,255,255,0.35)",
+  },
 }
 
 const drawPlatformShape = (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, kind: PlatformKind) => {
-  const { fill, stroke, glow } = PLATFORM_STYLE[kind]
+  const { top, fill, stroke, glow } = PLATFORM_STYLE[kind]
+  const grad = ctx.createLinearGradient(0, y, 0, y + PLATFORM_H)
+  grad.addColorStop(0, top)
+  grad.addColorStop(1, fill)
   ctx.save()
   ctx.shadowColor = glow
   ctx.shadowBlur = 12
-  ctx.fillStyle = fill
+  ctx.fillStyle = grad
   rr(ctx, x, y, w, PLATFORM_H, 7)
   ctx.fill()
   ctx.restore()
@@ -350,30 +421,60 @@ const drawPlatformShape = (ctx: CanvasRenderingContext2D, x: number, y: number, 
   ctx.lineWidth = 2.5
   rr(ctx, x, y, w, PLATFORM_H, 7)
   ctx.stroke()
-  ctx.strokeStyle = "rgba(255,255,255,0.4)"
+  ctx.strokeStyle = "rgba(255,255,255,0.45)"
   ctx.lineWidth = 1.5
   ctx.beginPath()
   ctx.moveTo(x + 7, y + 4)
   ctx.lineTo(x + w - 9, y + 4)
   ctx.stroke()
+  if (kind === "breakable") {
+    ctx.strokeStyle = "rgba(124,45,18,0.85)"
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.moveTo(x + w * 0.45, y + 1)
+    ctx.lineTo(x + w * 0.55, y + PLATFORM_H * 0.5)
+    ctx.lineTo(x + w * 0.47, y + PLATFORM_H - 1)
+    ctx.stroke()
+  }
 }
 
-const drawPlatform = (ctx: CanvasRenderingContext2D, p: Platform, time: number) => {
+// Platforms are pre-rendered once per kind: shadowBlur glows are expensive,
+// and a full-screen desktop field can show 30+ platforms every frame.
+const SPRITE_PAD = 14
+const platformSprites = new Map<string, HTMLCanvasElement>()
+const getPlatformSprite = (kind: PlatformKind, dpr: number) => {
+  const key = `${kind}@${dpr}`
+  let sprite = platformSprites.get(key)
+  if (!sprite) {
+    sprite = document.createElement("canvas")
+    sprite.width = Math.ceil((PLATFORM_W + SPRITE_PAD * 2) * dpr)
+    sprite.height = Math.ceil((PLATFORM_H + SPRITE_PAD * 2) * dpr)
+    const c = sprite.getContext("2d")
+    if (c) {
+      c.scale(dpr, dpr)
+      drawPlatformShape(c, SPRITE_PAD, SPRITE_PAD, PLATFORM_W, kind)
+    }
+    platformSprites.set(key, sprite)
+  }
+  return sprite
+}
+
+const drawPlatform = (ctx: CanvasRenderingContext2D, p: Platform, time: number, dpr: number) => {
   ctx.save()
   if (p.kind === "ghost" && p.fadingAt > 0) {
     ctx.globalAlpha = clamp(1 - (time - p.fadingAt) / 0.35, 0, 1)
   }
-  drawPlatformShape(ctx, p.x, p.y, PLATFORM_W, p.kind)
-
-  if (p.kind === "breakable") {
-    ctx.strokeStyle = "rgba(124,45,18,0.85)"
-    ctx.lineWidth = 1.5
-    ctx.beginPath()
-    ctx.moveTo(p.x + PLATFORM_W * 0.45, p.y + 1)
-    ctx.lineTo(p.x + PLATFORM_W * 0.55, p.y + PLATFORM_H * 0.5)
-    ctx.lineTo(p.x + PLATFORM_W * 0.47, p.y + PLATFORM_H - 1)
-    ctx.stroke()
+  // Brief dip under the player's weight on each bounce
+  if (p.landedAt > 0 && time - p.landedAt < 0.22) {
+    ctx.translate(0, Math.sin(((time - p.landedAt) / 0.22) * Math.PI) * 4)
   }
+  ctx.drawImage(
+    getPlatformSprite(p.kind, dpr),
+    p.x - SPRITE_PAD,
+    p.y - SPRITE_PAD,
+    PLATFORM_W + SPRITE_PAD * 2,
+    PLATFORM_H + SPRITE_PAD * 2,
+  )
 
   // Attachments
   if (p.attachment === "spring") {
@@ -492,9 +593,22 @@ const drawPlatform = (ctx: CanvasRenderingContext2D, p: Platform, time: number) 
   ctx.restore()
 }
 
-const drawMonster = (ctx: CanvasRenderingContext2D, m: MonsterEntity, time: number) => {
+// `charge` (0..1) telegraphs an incoming shot so enemy fire is reactable
+const drawMonster = (ctx: CanvasRenderingContext2D, m: MonsterEntity, time: number, charge = 0) => {
   const s = MONSTER_SIZE
   ctx.save()
+  if (charge > 0) {
+    const cx = m.x + s / 2
+    const cy = m.y + s / 2
+    const r = s * (0.55 + 0.25 * charge) + Math.sin(time * 40) * 1.5
+    const g = ctx.createRadialGradient(cx, cy, s * 0.2, cx, cy, r)
+    g.addColorStop(0, `rgba(232,121,249,${(0.45 * charge).toFixed(3)})`)
+    g.addColorStop(1, "rgba(232,121,249,0)")
+    ctx.fillStyle = g
+    ctx.beginPath()
+    ctx.arc(cx, cy, r, 0, Math.PI * 2)
+    ctx.fill()
+  }
   if (m.kind === "blob") {
     const wob = Math.sin(time * 5 + m.phase) * 2
     const cx = m.x + s / 2
@@ -619,6 +733,149 @@ const drawBlackHole = (ctx: CanvasRenderingContext2D, h: BlackHole, time: number
   }
 }
 
+const drawGem = (ctx: CanvasRenderingContext2D, g: Gem, time: number) => {
+  const s = GEM_SIZE
+  const cx = g.x + s / 2
+  const cy = g.y + s / 2 + Math.sin(time * 3 + g.phase) * 3
+  const glow = ctx.createRadialGradient(cx, cy, 2, cx, cy, s)
+  glow.addColorStop(0, "rgba(253,224,71,0.45)")
+  glow.addColorStop(1, "rgba(253,224,71,0)")
+  ctx.fillStyle = glow
+  ctx.beginPath()
+  ctx.arc(cx, cy, s, 0, Math.PI * 2)
+  ctx.fill()
+
+  const w = s * 0.5
+  const h = s * 0.55
+  const body = ctx.createLinearGradient(cx - w, cy - h, cx + w, cy + h)
+  body.addColorStop(0, "#fef9c3")
+  body.addColorStop(0.45, "#facc15")
+  body.addColorStop(1, "#d97706")
+  ctx.fillStyle = body
+  ctx.strokeStyle = "#92400e"
+  ctx.lineWidth = 1.6
+  ctx.beginPath()
+  ctx.moveTo(cx - w, cy - h * 0.25)
+  ctx.lineTo(cx - w * 0.5, cy - h * 0.75)
+  ctx.lineTo(cx + w * 0.5, cy - h * 0.75)
+  ctx.lineTo(cx + w, cy - h * 0.25)
+  ctx.lineTo(cx, cy + h)
+  ctx.closePath()
+  ctx.fill()
+  ctx.stroke()
+  // Facets
+  ctx.strokeStyle = "rgba(146,64,14,0.55)"
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.moveTo(cx - w, cy - h * 0.25)
+  ctx.lineTo(cx + w, cy - h * 0.25)
+  ctx.moveTo(cx - w * 0.5, cy - h * 0.75)
+  ctx.lineTo(cx - w * 0.15, cy - h * 0.25)
+  ctx.lineTo(cx, cy + h)
+  ctx.moveTo(cx + w * 0.5, cy - h * 0.75)
+  ctx.lineTo(cx + w * 0.15, cy - h * 0.25)
+  ctx.lineTo(cx, cy + h)
+  ctx.stroke()
+  // Twinkle
+  const tw = Math.max(0, Math.sin(time * 4 + g.phase * 3))
+  if (tw > 0.2) {
+    const sx = cx + w * 0.55
+    const sy = cy - h * 0.8
+    const r = 4 * tw
+    ctx.fillStyle = `rgba(255,255,255,${tw.toFixed(3)})`
+    ctx.beginPath()
+    ctx.moveTo(sx, sy - r)
+    ctx.lineTo(sx + r * 0.25, sy - r * 0.25)
+    ctx.lineTo(sx + r, sy)
+    ctx.lineTo(sx + r * 0.25, sy + r * 0.25)
+    ctx.lineTo(sx, sy + r)
+    ctx.lineTo(sx - r * 0.25, sy + r * 0.25)
+    ctx.lineTo(sx - r, sy)
+    ctx.lineTo(sx - r * 0.25, sy - r * 0.25)
+    ctx.closePath()
+    ctx.fill()
+  }
+}
+
+// --- Starting ground: a hill you launch from, which scrolls away as you climb
+const groundRand = mulberry32(99)
+const GROUND_DECOR = Array.from({ length: 16 }, () => ({
+  fx: groundRand(),
+  tree: groundRand() < 0.45,
+  s: 0.7 + groundRand() * 0.8,
+  ph: groundRand() * Math.PI * 2,
+}))
+
+const hillY = (x: number, base: number, amp: number, seed: number) =>
+  base - amp * (0.5 + 0.3 * Math.sin(x * 0.006 + seed) + 0.2 * Math.sin(x * 0.017 + seed * 2.3))
+
+// The walkable ground surface at screen x (matches what is drawn)
+const groundSurface = (x: number, gy: number) => hillY(x, gy + 18, 14, 4.2)
+
+const drawGround = (ctx: CanvasRenderingContext2D, gy: number, width: number, height: number, climb: number, time: number) => {
+  // Far hills recede more slowly than the ground for a touch of depth
+  const backBase = height - 100 + climb * 0.55
+  if (backBase - 90 < height) {
+    ctx.fillStyle = "rgba(46,32,96,0.9)"
+    ctx.beginPath()
+    ctx.moveTo(0, height + 5)
+    for (let x = 0; x <= width + 20; x += 20) ctx.lineTo(x, hillY(x, backBase, 70, 1.7))
+    ctx.lineTo(width + 20, height + 5)
+    ctx.closePath()
+    ctx.fill()
+  }
+  if (gy - 60 > height) return
+
+  for (const d of GROUND_DECOR) {
+    const x = d.fx * width
+    const y = groundSurface(x, gy) + 2
+    if (d.tree) {
+      const h = 46 * d.s
+      ctx.fillStyle = "#1c1442"
+      for (let i = 0; i < 3; i++) {
+        const tw = (14 - i * 3.5) * d.s
+        const ty = y - h * (0.3 + i * 0.25)
+        ctx.beginPath()
+        ctx.moveTo(x - tw, ty + h * 0.3)
+        ctx.lineTo(x, ty - h * 0.18)
+        ctx.lineTo(x + tw, ty + h * 0.3)
+        ctx.closePath()
+        ctx.fill()
+      }
+    } else {
+      const sz = 7 * d.s
+      const pulse = 0.6 + 0.4 * Math.sin(time * 2 + d.ph)
+      ctx.fillStyle = "#2a1f5c"
+      ctx.fillRect(x - sz * 0.22, y - sz * 1.2, sz * 0.44, sz * 1.2)
+      ctx.save()
+      ctx.shadowColor = "rgba(196,181,253,0.9)"
+      ctx.shadowBlur = 10 * pulse
+      ctx.fillStyle = `rgba(196,181,253,${(0.55 + 0.35 * pulse).toFixed(3)})`
+      ctx.beginPath()
+      ctx.ellipse(x, y - sz * 1.2, sz, sz * 0.62, 0, Math.PI, Math.PI * 2)
+      ctx.fill()
+      ctx.restore()
+    }
+  }
+
+  ctx.fillStyle = "#150f33"
+  ctx.beginPath()
+  ctx.moveTo(0, Math.max(height, gy) + 40)
+  for (let x = 0; x <= width + 20; x += 16) ctx.lineTo(x, groundSurface(x, gy))
+  ctx.lineTo(width + 20, Math.max(height, gy) + 40)
+  ctx.closePath()
+  ctx.fill()
+  ctx.strokeStyle = "rgba(167,139,250,0.45)"
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  for (let x = 0; x <= width + 20; x += 16) {
+    const y = groundSurface(x, gy)
+    if (x === 0) ctx.moveTo(x, y)
+    else ctx.lineTo(x, y)
+  }
+  ctx.stroke()
+}
+
 // ---------------------------------------------------------------------------
 // Avatars — five original monsters, each with its own silhouette. All are
 // drawn centred on (0,0) facing right; the caller mirrors/squashes/rotates.
@@ -630,6 +887,13 @@ const AVATAR_NAMES: Record<AvatarId, string> = {
   ember: "Ember",
   squiddy: "Squiddy",
   boo: "Boo",
+}
+const AVATAR_TAGLINES: Record<AvatarId, string> = {
+  gloop: "Squishy, sticky, always optimistic",
+  batty: "Night owl. Well — night bat.",
+  ember: "Hot-headed and hopping mad",
+  squiddy: "Honestly too sleepy for this",
+  boo: "Shy, spooky, surprisingly bouncy",
 }
 const AVATAR_KEY = "monsterhop-avatar"
 
@@ -1026,8 +1290,9 @@ const drawAvatarBody = (ctx: CanvasRenderingContext2D, id: AvatarId, o: AvatarPo
   }
 }
 
-// Small static preview canvas used by the avatar picker on the menu
-function AvatarPreview({ id }: { id: AvatarId }) {
+// Preview canvas for the menu. `animate` gives the selected monster a live
+// idle hop; the rest stay still so five rAF loops aren't running at once.
+function AvatarPreview({ id, size = 56, animate = false }: { id: AvatarId; size?: number; animate?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const cv = ref.current
@@ -1035,17 +1300,34 @@ function AvatarPreview({ id }: { id: AvatarId }) {
     const ctx = cv.getContext("2d")
     if (!ctx) return
     const dpr = Math.min(2, window.devicePixelRatio || 1)
-    cv.width = 52 * dpr
-    cv.height = 52 * dpr
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, 52, 52)
-    ctx.save()
-    ctx.translate(26, 28)
-    ctx.scale(0.82, 0.82)
-    drawAvatarBody(ctx, id, { time: 1.2, shooting: false, dead: false })
-    ctx.restore()
-  }, [id])
-  return <canvas ref={ref} className="h-[52px] w-[52px]" aria-hidden />
+    cv.width = size * dpr
+    cv.height = size * dpr
+    const scale = size / 64
+    const paint = (t: number) => {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, size, size)
+      const hop = animate ? Math.abs(Math.sin(t * 3.2)) : 0
+      const squash = animate ? 1 + 0.08 * (1 - hop) * (1 - hop) : 1
+      ctx.save()
+      ctx.translate(size / 2, size * 0.56 - hop * size * 0.1)
+      ctx.scale(scale * 1.05 * squash, (scale * 1.05) / squash)
+      drawAvatarBody(ctx, id, { time: animate ? t : 1.2, shooting: false, dead: false })
+      ctx.restore()
+    }
+    if (!animate) {
+      paint(0)
+      return
+    }
+    let raf = 0
+    const start = performance.now()
+    const loop = (now: number) => {
+      paint((now - start) / 1000)
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [id, size, animate])
+  return <canvas ref={ref} style={{ width: size, height: size }} aria-hidden />
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1338,16 @@ export default function MonsterHop() {
   const [highScore, setHighScore] = useState(0)
   const [isMuted, setIsMuted] = useState(false)
   const [avatar, setAvatarState] = useState<AvatarId>("gloop")
-  const [finalStats, setFinalStats] = useState({ score: 0, kills: 0, isNewBest: false })
+  const [finalStats, setFinalStats] = useState({
+    score: 0,
+    kills: 0,
+    gems: 0,
+    height: 0,
+    zone: 0,
+    cause: "",
+    isNewBest: false,
+  })
+  const [shownScore, setShownScore] = useState(0)
 
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const worldRef = useRef<World | null>(null)
@@ -1068,6 +1359,9 @@ export default function MonsterHop() {
   const tickRef = useRef<(dt: number) => void>(() => {})
   const reducedMotionRef = useRef(false)
   const avatarRef = useRef<AvatarId>("gloop")
+  const bestHeightRef = useRef(0)
+  const deathCauseRef = useRef("")
+  const vignetteRef = useRef<{ w: number; h: number; grad: CanvasGradient | null }>({ w: 0, h: 0, grad: null })
 
   const sounds = useSoundEffects()
 
@@ -1084,6 +1378,10 @@ export default function MonsterHop() {
       highScoreRef.current = stored
     }
     setIsMuted(readStorage(MUTED_KEY) === "1")
+    const bestHeight = Number(readStorage(BEST_HEIGHT_KEY) ?? 0)
+    if (Number.isFinite(bestHeight) && bestHeight > 0) bestHeightRef.current = bestHeight
+    // Saves from before bonuses existed scored pure height (climb / 2)
+    else if (Number.isFinite(stored) && stored > 0) bestHeightRef.current = stored * 2
     const savedAvatar = readStorage(AVATAR_KEY)
     if (savedAvatar && (AVATAR_IDS as string[]).includes(savedAvatar)) {
       avatarRef.current = savedAvatar as AvatarId
@@ -1160,16 +1458,31 @@ export default function MonsterHop() {
       setHighScore(score)
       writeStorage(HIGH_SCORE_KEY, String(score))
     }
-    setFinalStats({ score, kills: w.kills, isNewBest })
+    if (w.totalClimb > bestHeightRef.current) {
+      bestHeightRef.current = w.totalClimb
+      writeStorage(BEST_HEIGHT_KEY, String(Math.floor(w.totalClimb)))
+    }
+    setFinalStats({
+      score,
+      kills: w.kills,
+      gems: w.gemsCollected,
+      height: Math.floor(w.totalClimb / 10),
+      zone: w.zone,
+      cause: deathCauseRef.current || "Took a long fall",
+      isNewBest,
+    })
     sounds.playGameOver()
     setState("gameOver")
   }, [setState, sounds])
 
   const die = useCallback(
-    (w: World) => {
+    (w: World, cause: string) => {
       sounds.playHit()
+      deathCauseRef.current = cause
       w.fellAt = w.time
-      w.shakeUntil = w.time + 0.35
+      shake(w, 0.4, 8)
+      w.flashUntil = w.time + 0.18
+      w.stompChain = 0
       w.player.vy = -420
       w.player.gear = "none"
       w.player.shoeJumps = 0
@@ -1240,6 +1553,11 @@ export default function MonsterHop() {
         pt.life -= dt
       }
       world.particles = world.particles.filter((pt) => pt.life > 0)
+      for (const pu of world.popups) {
+        pu.y -= 42 * dt
+        pu.life -= dt
+      }
+      world.popups = world.popups.filter((pu) => pu.life > 0)
       for (const sh of world.shards) {
         sh.x += sh.vx * dt
         sh.y += sh.vy * dt
@@ -1350,6 +1668,8 @@ export default function MonsterHop() {
                 // no bounce — you crash straight through
               } else {
                 p.y = hit.y - PLAYER_H
+                hit.landedAt = world.time
+                world.stompChain = 0
                 if (hit.kind === "ghost") hit.fadingAt = world.time
                 const springX = attachAnchorX(hit)
                 const center = p.x + PLAYER_W / 2
@@ -1377,6 +1697,17 @@ export default function MonsterHop() {
                 }
               }
             }
+            if (!landed) {
+              // The starting ground is solid until it scrolls off-screen
+              const surface = groundSurface(p.x + PLAYER_W / 2, groundY(world, height))
+              if (surface < height + 30 && prevBottom <= surface + 8 && newBottom >= surface) {
+                p.y = surface - PLAYER_H
+                p.vy = -JUMP_V
+                world.stompChain = 0
+                sounds.playJump()
+                addParticles(world, p.x + PLAYER_W / 2, surface, 6, "#a78bfa", 120)
+              }
+            }
           }
 
           // Item pickups sitting on platforms (worn/held power-ups)
@@ -1398,6 +1729,22 @@ export default function MonsterHop() {
               sounds.playCollect()
               addParticles(world, ix + 10, iy + 10, 10, "#fde68a", 200)
             }
+          }
+
+          // Gems
+          if (world.gems.length > 0) {
+            const taken = new Set<number>()
+            for (const g of world.gems) {
+              if (p.x < g.x + GEM_SIZE && p.x + PLAYER_W > g.x && p.y < g.y + GEM_SIZE && p.y + PLAYER_H > g.y) {
+                taken.add(g.id)
+                world.bonus += GEM_POINTS
+                world.gemsCollected += 1
+                addParticles(world, g.x + GEM_SIZE / 2, g.y + GEM_SIZE / 2, 8, "#fde047", 170)
+                addPopup(world, g.x + GEM_SIZE / 2, g.y, `+${GEM_POINTS}`, "#fde047")
+                sounds.playGem()
+              }
+            }
+            if (taken.size > 0) world.gems = world.gems.filter((g) => !taken.has(g.id))
           }
 
           // Monsters
@@ -1433,23 +1780,39 @@ export default function MonsterHop() {
             if (gearActive || stompedIt) {
               stomped.add(m.id)
               world.kills += 1
+              // Chained stomps (no platform touch in between) multiply the reward
+              const chained = stompedIt && !gearActive
+              if (chained) world.stompChain += 1
+              const points = KILL_POINTS * (chained ? world.stompChain : 1)
+              world.bonus += points
+              addPopup(
+                world,
+                m.x + MONSTER_SIZE / 2,
+                m.y,
+                chained && world.stompChain > 1 ? `+${points} ×${world.stompChain}` : `+${points}`,
+                "#93c5fd",
+              )
               addParticles(world, m.x + MONSTER_SIZE / 2, m.y + MONSTER_SIZE / 2, 14, "#93c5fd", 240)
               sounds.playStomp()
-              if (stompedIt && !gearActive) p.vy = -JUMP_V
+              shake(world, 0.12, 3)
+              if (chained) p.vy = -JUMP_V
             } else if (world.time < p.shieldUntil) {
               // The shield absorbs one hit and takes the monster with it
               p.shieldUntil = 0
               stomped.add(m.id)
               world.kills += 1
+              world.bonus += KILL_POINTS
+              addPopup(world, m.x + MONSTER_SIZE / 2, m.y, `+${KILL_POINTS}`, "#67e8f9")
               addParticles(world, m.x + MONSTER_SIZE / 2, m.y + MONSTER_SIZE / 2, 16, "#67e8f9", 260)
               sounds.playShieldPop()
+              shake(world, 0.15, 4)
             } else {
               hitByMonster = true
               break
             }
           }
           if (stomped.size > 0) world.monsters = world.monsters.filter((m) => !stomped.has(m.id))
-          if (hitByMonster) die(world)
+          if (hitByMonster) die(world, "Bumped into a monster")
 
           // Pellets. Collision is swept along the pellet's path: at the 50ms dt
           // cap a pellet travels further than a monster is tall, so a simple
@@ -1479,6 +1842,8 @@ export default function MonsterHop() {
                   deadMonsters.add(m.id)
                   spentPellets.add(pe.id)
                   world.kills += 1
+                  world.bonus += KILL_POINTS
+                  addPopup(world, m.x + MONSTER_SIZE / 2, m.y, `+${KILL_POINTS}`, "#fef08a")
                   addParticles(world, m.x + MONSTER_SIZE / 2, m.y + MONSTER_SIZE / 2, 14, "#93c5fd", 240)
                   sounds.playStomp()
                   break
@@ -1494,21 +1859,24 @@ export default function MonsterHop() {
             // Enemy fire: on-screen monsters lob goo at you once you're high
             // enough, more often and faster the deeper you climb
             const d = difficulty(world.totalClimb)
-            if (world.totalClimb > 6000) {
-              for (const m of world.monsters) {
-                if (world.enemyShots.length >= 12) break
-                if (m.y < 20 || m.y > height - 40) continue
-                if (world.time < m.nextShotAt) continue
-                m.nextShotAt = world.time + 3.2 - 1.4 * d + Math.random() * 1.8
-                const cx = m.x + MONSTER_SIZE / 2
-                const cy = m.y + MONSTER_SIZE / 2
-                const dx = p.x + PLAYER_W / 2 - cx
-                const dy = p.y + PLAYER_H / 2 - cy
-                const len = Math.hypot(dx, dy) || 1
-                const sp = 230 + 150 * d
-                world.enemyShots.push({ id: nextId(), x: cx, y: cy, vx: (dx / len) * sp, vy: (dy / len) * sp })
-                sounds.playEnemyShoot()
+            for (const m of world.monsters) {
+              const canFire = world.totalClimb > 6000 && m.y >= 20 && m.y <= height - 40
+              if (!canFire) {
+                // Hold fire until eligible, then always give a telegraph window
+                // first, so a monster scrolling into view can't snipe instantly
+                if (m.nextShotAt < world.time + 0.6) m.nextShotAt = world.time + 0.6
+                continue
               }
+              if (world.enemyShots.length >= 12 || world.time < m.nextShotAt) continue
+              m.nextShotAt = world.time + 3.2 - 1.4 * d + Math.random() * 1.8
+              const cx = m.x + MONSTER_SIZE / 2
+              const cy = m.y + MONSTER_SIZE / 2
+              const dx = p.x + PLAYER_W / 2 - cx
+              const dy = p.y + PLAYER_H / 2 - cy
+              const len = Math.hypot(dx, dy) || 1
+              const sp = 230 + 150 * d
+              world.enemyShots.push({ id: nextId(), x: cx, y: cy, vx: (dx / len) * sp, vy: (dy / len) * sp })
+              sounds.playEnemyShoot()
             }
             for (const es of world.enemyShots) {
               es.x += es.vx * dt
@@ -1527,7 +1895,7 @@ export default function MonsterHop() {
                   addParticles(world, es.x, es.y, 10, "#67e8f9", 200)
                   sounds.playShieldPop()
                 } else {
-                  die(world)
+                  die(world, "Splatted by monster goo")
                 }
                 break
               }
@@ -1541,6 +1909,7 @@ export default function MonsterHop() {
               const dx = p.x + PLAYER_W / 2 - hole.x
               const dy = p.y + PLAYER_H / 2 - hole.y
               if (dx * dx + dy * dy < (hole.r + 10) * (hole.r + 10)) {
+                deathCauseRef.current = "Swallowed by a black hole"
                 world.suckedAt = world.time
                 world.suckX = hole.x
                 world.suckY = hole.y
@@ -1564,19 +1933,31 @@ export default function MonsterHop() {
               for (const es of world.enemyShots) es.y += diff
               for (const sh of world.shards) sh.y += diff
               for (const pt of world.particles) pt.y += diff
+              for (const g of world.gems) g.y += diff
+              for (const pu of world.popups) pu.y += diff
               world.nextSpawnY += diff
               world.totalClimb += diff
             }
-            world.score = Math.floor(world.totalClimb / 2)
+            world.score = Math.floor(world.totalClimb / 2) + world.bonus
+            const z = zoneIndex(world.totalClimb)
+            if (z > world.zone) {
+              world.zone = z
+              world.zoneBannerAt = world.time
+              sounds.playZone()
+            }
 
             // Spawn new rows and drop everything off-screen
             while (world.nextSpawnY > -300) spawnRow(world, width)
             world.platforms = world.platforms.filter((pl) => pl.y < height + 40)
             world.monsters = world.monsters.filter((m) => m.y < height + 80)
             world.holes = world.holes.filter((hole) => hole.y < height + 100)
+            world.gems = world.gems.filter((g) => g.y < height + 40)
 
             // Fell off the bottom
-            if (p.y > height + 20) endGame()
+            if (p.y > height + 20) {
+              deathCauseRef.current = "Took a long fall"
+              endGame()
+            }
           }
         } else if (st === "falling" && p.y > height + 250) {
           endGame()
@@ -1666,17 +2047,48 @@ export default function MonsterHop() {
       }
     }
 
+    // Shooting stars once you're up in the dark sky. Each time slot gets a
+    // deterministic streak, so no state needs storing between frames.
+    if (world.totalClimb > 9000) {
+      const period = 3.3
+      const slot = Math.floor(world.time / period)
+      const t = (world.time - slot * period) / 0.65
+      if (t < 1) {
+        const rnd = mulberry32(slot * 7919 + 13)
+        const sx = rnd() * width * 0.8 + width * 0.1
+        const sy = rnd() * height * 0.45
+        const len = 140 + rnd() * 120
+        const hx = sx + t * len
+        const hy = sy + t * len * 0.45
+        const a = Math.sin(t * Math.PI) * clamp((world.totalClimb - 9000) / 4000, 0, 1)
+        const g = ctx.createLinearGradient(hx - 70, hy - 31, hx, hy)
+        g.addColorStop(0, "rgba(255,255,255,0)")
+        g.addColorStop(1, `rgba(255,255,255,${(0.85 * a).toFixed(3)})`)
+        ctx.strokeStyle = g
+        ctx.lineWidth = 2
+        ctx.lineCap = "round"
+        ctx.beginPath()
+        ctx.moveTo(hx - 70, hy - 31)
+        ctx.lineTo(hx, hy)
+        ctx.stroke()
+        ctx.lineCap = "butt"
+      }
+    }
+
     // Camera shake (skipped when the OS asks for reduced motion)
     ctx.save()
     if (world.time < world.shakeUntil && !reducedMotionRef.current) {
-      const k = (world.shakeUntil - world.time) / 0.35
-      ctx.translate(Math.sin(world.time * 80) * 6 * k, Math.cos(world.time * 67) * 5 * k)
+      const k = clamp((world.shakeUntil - world.time) / 0.3, 0, 1)
+      const m = world.shakeMag * k
+      ctx.translate(Math.sin(world.time * 80) * m, Math.cos(world.time * 67) * m * 0.8)
     }
+
+    drawGround(ctx, groundY(world, height), width, height, world.totalClimb, world.time)
 
     // Personal-best marker: the altitude you need to pass to beat your record.
     // The world scrolls down as totalClimb rises, so the line drifts toward the
-    // player and meets them exactly when their score ties the record.
-    const bestClimb = highScoreRef.current * 2
+    // player and meets them exactly when they tie their highest climb.
+    const bestClimb = bestHeightRef.current
     if (bestClimb > 0 && stateRef.current !== "menu") {
       const markerY = height * 0.4 + (world.totalClimb - bestClimb)
       if (markerY > HUD_H + 8 && markerY < height) {
@@ -1689,11 +2101,11 @@ export default function MonsterHop() {
         ctx.lineTo(width, markerY)
         ctx.stroke()
         ctx.setLineDash([])
-        ctx.font = "800 10px system-ui, -apple-system, sans-serif"
+        ctx.font = `600 11px ${GAME_FONT}`
         ctx.fillStyle = "rgba(251,191,36,0.95)"
         ctx.textAlign = "right"
         ctx.textBaseline = "bottom"
-        ctx.fillText("BEST", width - 8, markerY - 3)
+        ctx.fillText("YOUR BEST", width - 10, markerY - 4)
         ctx.textAlign = "left"
         ctx.textBaseline = "alphabetic"
         ctx.restore()
@@ -1701,7 +2113,8 @@ export default function MonsterHop() {
     }
 
     for (const hole of world.holes) drawBlackHole(ctx, hole, world.time)
-    for (const pl of world.platforms) drawPlatform(ctx, pl, world.time)
+    for (const pl of world.platforms) drawPlatform(ctx, pl, world.time, dpr)
+    for (const g of world.gems) drawGem(ctx, g, world.time)
 
     // Shards from broken platforms
     for (const sh of world.shards) {
@@ -1717,7 +2130,12 @@ export default function MonsterHop() {
       ctx.restore()
     }
 
-    for (const m of world.monsters) drawMonster(ctx, m, world.time)
+    const firing = world.totalClimb > 6000 && stateRef.current === "playing"
+    for (const m of world.monsters) {
+      const onScreen = m.y >= 20 && m.y <= height - 40
+      const charge = firing && onScreen ? clamp(1 - (m.nextShotAt - world.time) / 0.5, 0, 1) : 0
+      drawMonster(ctx, m, world.time, charge)
+    }
 
     // Enemy goo
     for (const es of world.enemyShots) {
@@ -1759,9 +2177,91 @@ export default function MonsterHop() {
     ctx.globalAlpha = 1
 
     drawPlayer(ctx, world)
+
+    // Floating score popups
+    ctx.textAlign = "center"
+    ctx.textBaseline = "middle"
+    ctx.font = `700 18px ${GAME_FONT}`
+    ctx.lineJoin = "round"
+    for (const pu of world.popups) {
+      const a = clamp(pu.life / 0.35, 0, 1)
+      const pop = 1 + 0.25 * clamp((pu.life - 0.75) / 0.15, 0, 1)
+      ctx.save()
+      ctx.globalAlpha = a
+      ctx.translate(pu.x, pu.y)
+      ctx.scale(pop, pop)
+      ctx.lineWidth = 4
+      ctx.strokeStyle = "rgba(15,10,40,0.8)"
+      ctx.strokeText(pu.text, 0, 0)
+      ctx.fillStyle = pu.color
+      ctx.fillText(pu.text, 0, 0)
+      ctx.restore()
+    }
+    ctx.textAlign = "left"
+    ctx.textBaseline = "alphabetic"
     ctx.restore()
 
-    if (stateRef.current !== "menu") drawHud(ctx, world, width)
+    // Vignette, rebuilt only when the canvas size changes
+    const vig = vignetteRef.current
+    if (!vig.grad || vig.w !== width || vig.h !== height) {
+      const g = ctx.createRadialGradient(
+        width / 2,
+        height / 2,
+        Math.min(width, height) * 0.35,
+        width / 2,
+        height / 2,
+        Math.hypot(width, height) * 0.6,
+      )
+      g.addColorStop(0, "rgba(5,3,20,0)")
+      g.addColorStop(1, "rgba(5,3,20,0.55)")
+      vignetteRef.current = { w: width, h: height, grad: g }
+    }
+    ctx.fillStyle = vignetteRef.current.grad as CanvasGradient
+    ctx.fillRect(0, 0, width, height)
+
+    // Death flash
+    if (world.time < world.flashUntil) {
+      ctx.fillStyle = `rgba(255,255,255,${(((world.flashUntil - world.time) / 0.18) * 0.45).toFixed(3)})`
+      ctx.fillRect(0, 0, width, height)
+    }
+
+    if (stateRef.current !== "menu") {
+      drawZoneBanner(ctx, world, width, height)
+      drawHud(ctx, world, width)
+    }
+  }
+
+  const drawZoneBanner = (ctx: CanvasRenderingContext2D, world: World, width: number, height: number) => {
+    const t = world.time - world.zoneBannerAt
+    const DURATION = 2.6
+    if (t < 0 || t > DURATION) return
+    const a = Math.min(clamp(t / 0.3, 0, 1), clamp((DURATION - t) / 0.5, 0, 1))
+    const slide = (1 - clamp(t / 0.35, 0, 1)) * -14
+    const cy = height * 0.24 + slide
+    ctx.save()
+    ctx.globalAlpha = a
+    ctx.textAlign = "center"
+    ctx.textBaseline = "middle"
+    ctx.font = `600 14px ${GAME_FONT}`
+    ctx.fillStyle = "rgba(255,255,255,0.7)"
+    const label = `ZONE ${world.zone + 1}`
+    // Manual letter-spacing: canvas letterSpacing isn't available everywhere
+    const spaced = label.split("").join(String.fromCharCode(8202))
+    ctx.fillText(spaced, width / 2, cy - 26)
+    ctx.font = `700 44px ${GAME_FONT}`
+    const name = ZONES[world.zone].name
+    const tw = ctx.measureText(name).width
+    const grad = ctx.createLinearGradient(width / 2 - tw / 2, 0, width / 2 + tw / 2, 0)
+    grad.addColorStop(0, "#bef264")
+    grad.addColorStop(0.5, "#6ee7b7")
+    grad.addColorStop(1, "#67e8f9")
+    ctx.lineJoin = "round"
+    ctx.lineWidth = 7
+    ctx.strokeStyle = "rgba(15,10,40,0.65)"
+    ctx.strokeText(name, width / 2, cy + 10)
+    ctx.fillStyle = grad
+    ctx.fillText(name, width / 2, cy + 10)
+    ctx.restore()
   }
 
   const drawPlayer = (ctx: CanvasRenderingContext2D, world: World) => {
@@ -1873,50 +2373,84 @@ export default function MonsterHop() {
   }
 
   const drawHud = (ctx: CanvasRenderingContext2D, world: World, width: number) => {
-    ctx.textBaseline = "middle"
-    ctx.textAlign = "left"
     ctx.save()
-    ctx.shadowColor = "rgba(0,0,0,0.6)"
-    ctx.shadowBlur = 8
-    ctx.font = "800 32px system-ui, -apple-system, sans-serif"
-    ctx.fillStyle = "#ffffff"
-    ctx.fillText(String(world.score), 16, HUD_H / 2)
-    ctx.restore()
-
-    ctx.textAlign = "right"
-    ctx.font = "700 12px system-ui, -apple-system, sans-serif"
-    const beatingBest = highScoreRef.current > 0 && world.score > highScoreRef.current
-    ctx.fillStyle = beatingBest ? "rgba(251,191,36,0.95)" : "rgba(255,255,255,0.55)"
-    ctx.fillText(beatingBest ? "NEW BEST ★" : `BEST ${Math.max(highScoreRef.current, world.score)}`, width - 96, HUD_H / 2)
     ctx.textAlign = "left"
+    ctx.textBaseline = "alphabetic"
 
-    // Active power-up bars, stacked under the score
+    // Score panel: score on top, height and zone underneath
+    const scoreText = world.score.toLocaleString()
+    const subText = `${Math.floor(world.totalClimb / 10).toLocaleString()} m · ${ZONES[world.zone].name}`
+    ctx.font = `700 30px ${GAME_FONT}`
+    const scoreW = ctx.measureText(scoreText).width
+    ctx.font = `500 12px ${GAME_FONT}`
+    const subW = ctx.measureText(subText).width
+    const panelW = Math.max(scoreW, subW) + 32
+    ctx.fillStyle = "rgba(15,10,40,0.62)"
+    rr(ctx, 12, 10, panelW, 60, 16)
+    ctx.fill()
+    ctx.strokeStyle = "rgba(255,255,255,0.12)"
+    ctx.lineWidth = 1
+    ctx.stroke()
+    ctx.font = `700 30px ${GAME_FONT}`
+    ctx.fillStyle = "#ffffff"
+    ctx.fillText(scoreText, 28, 44)
+    ctx.font = `500 12px ${GAME_FONT}`
+    ctx.fillStyle = "rgba(255,255,255,0.62)"
+    ctx.fillText(subText, 28, 61)
+
+    // Best pill, left of the mute/pause buttons (hidden until a record exists)
+    const beatingBest = highScoreRef.current > 0 && world.score > highScoreRef.current
+    const bestText = beatingBest ? "NEW BEST ★" : `BEST ${Math.max(highScoreRef.current, world.score).toLocaleString()}`
+    if (highScoreRef.current > 0) {
+      ctx.font = `600 12px ${GAME_FONT}`
+      const bestW = ctx.measureText(bestText).width + 22
+      const bx = width - 96 - bestW
+      ctx.fillStyle = beatingBest ? "rgba(251,191,36,0.92)" : "rgba(15,10,40,0.62)"
+      rr(ctx, bx, 14, bestW, 26, 13)
+      ctx.fill()
+      if (!beatingBest) {
+        ctx.strokeStyle = "rgba(255,255,255,0.12)"
+        ctx.stroke()
+      }
+      ctx.fillStyle = beatingBest ? "#451a03" : "rgba(255,255,255,0.75)"
+      ctx.fillText(bestText, bx + 11, 31)
+    }
+
+    // Active power-ups as labelled chips with a draining bar
     const p = world.player
     if (stateRef.current === "playing") {
-      let barY = HUD_H + 8
-      const bar = (label: string, frac: number, color: string) => {
-        ctx.fillStyle = "rgba(255,255,255,0.14)"
-        rr(ctx, 16, barY, 110, 14, 7)
+      let chipY = 78
+      const chip = (label: string, frac: number, color: string) => {
+        ctx.fillStyle = "rgba(15,10,40,0.55)"
+        rr(ctx, 12, chipY, 140, 26, 13)
         ctx.fill()
         ctx.fillStyle = color
-        rr(ctx, 18, barY + 2, 106 * clamp(frac, 0, 1), 10, 5)
+        ctx.beginPath()
+        ctx.arc(26, chipY + 13, 5, 0, Math.PI * 2)
         ctx.fill()
-        ctx.font = "800 9px system-ui, -apple-system, sans-serif"
-        ctx.fillStyle = "rgba(255,255,255,0.85)"
-        ctx.fillText(label, 22, barY + 7)
-        barY += 18
+        ctx.font = `600 11px ${GAME_FONT}`
+        ctx.fillStyle = "rgba(255,255,255,0.9)"
+        ctx.fillText(label, 37, chipY + 12)
+        ctx.fillStyle = "rgba(255,255,255,0.15)"
+        rr(ctx, 37, chipY + 17, 104, 4, 2)
+        ctx.fill()
+        ctx.fillStyle = color
+        rr(ctx, 37, chipY + 17, 104 * clamp(frac, 0, 1), 4, 2)
+        ctx.fill()
+        chipY += 32
       }
       if (p.gear !== "none") {
         const total = p.gear === "propeller" ? PROPELLER_DURATION : JETPACK_DURATION
-        bar(p.gear === "propeller" ? "PROPELLER" : "JETPACK", (p.gearUntil - world.time) / total, p.gear === "propeller" ? "#facc15" : "#fb923c")
+        chip(
+          p.gear === "propeller" ? "Propeller" : "Jetpack",
+          (p.gearUntil - world.time) / total,
+          p.gear === "propeller" ? "#facc15" : "#fb923c",
+        )
       }
-      if (world.time < p.shieldUntil) {
-        bar("SHIELD", (p.shieldUntil - world.time) / SHIELD_DURATION, "#22d3ee")
-      }
-      if (p.shoeJumps > 0) {
-        bar(`SHOES ×${p.shoeJumps}`, p.shoeJumps / SHOE_JUMPS, "#f43f5e")
-      }
+      if (world.time < p.shieldUntil) chip("Shield", (p.shieldUntil - world.time) / SHIELD_DURATION, "#22d3ee")
+      if (p.shoeJumps > 0) chip(`Spring shoes ×${p.shoeJumps}`, p.shoeJumps / SHOE_JUMPS, "#f43f5e")
     }
+    ctx.restore()
   }
 
   // ------------------------------------------------------------------ input
@@ -1936,6 +2470,9 @@ export default function MonsterHop() {
       } else if (e.key === "p" || e.key === "P" || e.key === "Escape") {
         if (st === "playing") setState("paused")
         else if (st === "paused") setState("playing")
+        else if (st === "gameOver" && e.key === "Escape") goToMenuRef.current()
+      } else if (e.key === "r" || e.key === "R") {
+        if (st !== "menu") startGameRef.current()
       }
     }
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1991,7 +2528,10 @@ export default function MonsterHop() {
   const startGame = useCallback(() => {
     sounds.ensureAudio()
     const { w, h } = sizeRef.current
-    worldRef.current = createWorld(w, h)
+    const world = createWorld(w, h)
+    world.zoneBannerAt = 0.35
+    worldRef.current = world
+    deathCauseRef.current = ""
     keysRef.current = { left: false, right: false }
     pointerRef.current.active = false
     setState("playing")
@@ -2006,178 +2546,234 @@ export default function MonsterHop() {
     worldRef.current = createWorld(w, h)
     setState("menu")
   }, [setState])
+  const goToMenuRef = useRef(goToMenu)
+  useEffect(() => {
+    goToMenuRef.current = goToMenu
+  }, [goToMenu])
+
+  // Game-over score counts up instead of just appearing
+  useEffect(() => {
+    if (gameState !== "gameOver") return
+    const target = finalStats.score
+    if (reducedMotionRef.current || target === 0) {
+      setShownScore(target)
+      return
+    }
+    let raf = 0
+    const start = performance.now()
+    const step = (now: number) => {
+      const t = clamp((now - start) / 900, 0, 1)
+      setShownScore(Math.round(target * (1 - Math.pow(1 - t, 3))))
+      if (t < 1) raf = requestAnimationFrame(step)
+    }
+    raf = requestAnimationFrame(step)
+    return () => cancelAnimationFrame(raf)
+  }, [gameState, finalStats.score])
 
   // ----------------------------------------------------------------- render
+  const iconBtn =
+    "h-9 w-9 rounded-full border border-white/15 bg-[#0f0a28]/55 text-white shadow-sm backdrop-blur hover:bg-white/20 hover:text-white"
+  const card =
+    "w-full rounded-[28px] border border-white/15 bg-[#1b1442]/85 text-center text-white shadow-[0_24px_80px_rgba(0,0,0,0.55)] backdrop-blur-xl animate-in fade-in zoom-in-95 duration-300"
+  const primaryBtn =
+    "h-auto w-full rounded-2xl border-b-4 border-emerald-700 bg-gradient-to-b from-emerald-400 to-emerald-500 py-4 text-xl font-semibold text-emerald-950 shadow-[0_8px_30px_rgba(52,211,153,0.35)] transition-transform hover:scale-[1.02] hover:from-emerald-300 hover:to-emerald-400 active:translate-y-0.5 active:border-b-2"
+  const secondaryBtn =
+    "h-auto w-full rounded-2xl bg-white/10 py-3.5 text-base font-semibold text-white hover:bg-white/20 hover:text-white"
+
   return (
     <main className="fixed inset-0 overflow-hidden bg-[#0b0820] select-none">
       <canvas
-          ref={canvasRef}
-          className="absolute inset-0 h-full w-full touch-none"
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerEnd}
-          onPointerCancel={onPointerEnd}
-          onPointerLeave={onPointerEnd}
-        />
+        ref={canvasRef}
+        className="absolute inset-0 h-full w-full touch-none"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerEnd}
+        onPointerCancel={onPointerEnd}
+        onPointerLeave={onPointerEnd}
+      />
 
-        {/* Top-right controls */}
-        <div className="absolute right-2 top-1.5 flex gap-1.5">
+      {/* Top-right controls */}
+      <div className="absolute right-3 top-3 flex gap-2">
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={isMuted ? "Unmute" : "Mute"}
+          className={iconBtn}
+          onClick={() => {
+            sounds.ensureAudio()
+            setIsMuted((m) => !m)
+          }}
+        >
+          {isMuted ? <VolumeXIcon className="h-4 w-4" /> : <Volume2Icon className="h-4 w-4" />}
+        </Button>
+        {(gameState === "playing" || gameState === "paused") && (
           <Button
             variant="ghost"
             size="icon"
-            aria-label={isMuted ? "Unmute" : "Mute"}
-            className="h-8 w-8 rounded-full border border-white/15 bg-white/10 text-white shadow-sm backdrop-blur hover:bg-white/25 hover:text-white"
-            onClick={() => {
-              sounds.ensureAudio()
-              setIsMuted((m) => !m)
-            }}
+            aria-label={gameState === "playing" ? "Pause" : "Resume"}
+            className={iconBtn}
+            onClick={() => setState(gameState === "playing" ? "paused" : "playing")}
           >
-            {isMuted ? <VolumeXIcon className="h-4 w-4" /> : <Volume2Icon className="h-4 w-4" />}
+            {gameState === "playing" ? <PauseIcon className="h-4 w-4" /> : <PlayIcon className="h-4 w-4" />}
           </Button>
-          {(gameState === "playing" || gameState === "paused") && (
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={gameState === "playing" ? "Pause" : "Resume"}
-              className="h-8 w-8 rounded-full border border-white/15 bg-white/10 text-white shadow-sm backdrop-blur hover:bg-white/25 hover:text-white"
-              onClick={() => setState(gameState === "playing" ? "paused" : "playing")}
-            >
-              {gameState === "playing" ? <PauseIcon className="h-4 w-4" /> : <PlayIcon className="h-4 w-4" />}
+        )}
+      </div>
+
+      {/* Menu */}
+      {gameState === "menu" && (
+        <div className="absolute inset-0 flex items-center justify-center overflow-y-auto bg-[radial-gradient(ellipse_at_center,rgba(11,8,32,0.15),rgba(11,8,32,0.6))] p-4">
+          <div className={`${card} max-w-[420px] px-7 pb-6 pt-7`}>
+            <h1 className="text-[56px] font-bold leading-[0.95] tracking-tight drop-shadow-[0_4px_0_rgba(15,10,40,0.6)]">
+              <span className="bg-gradient-to-r from-lime-300 via-emerald-300 to-cyan-300 bg-clip-text text-transparent">
+                Monster
+              </span>{" "}
+              <span className="text-white">Hop</span>
+            </h1>
+            <p className="mt-2 text-[15px] font-medium text-white/60">Bounce through the night. Don&apos;t look down.</p>
+
+            {/* Selected monster showcase */}
+            <div className="mx-auto mt-5 flex items-center justify-center gap-4 rounded-3xl bg-white/[0.06] px-4 py-3">
+              <div className="rounded-2xl bg-[radial-gradient(circle,rgba(167,139,250,0.35),transparent_70%)]">
+                <AvatarPreview id={avatar} size={84} animate />
+              </div>
+              <div className="text-left">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-white/45">Your monster</p>
+                <p className="text-2xl font-bold leading-tight text-emerald-300">{AVATAR_NAMES[avatar]}</p>
+                <p className="text-sm text-white/60">{AVATAR_TAGLINES[avatar]}</p>
+              </div>
+            </div>
+
+            {/* Picker */}
+            <div className="mt-3 flex justify-center gap-2" role="radiogroup" aria-label="Choose your monster">
+              {AVATAR_IDS.map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="radio"
+                  aria-checked={avatar === id}
+                  aria-label={AVATAR_NAMES[id]}
+                  onClick={() => setAvatar(id)}
+                  className={`rounded-2xl border-2 p-0.5 transition-all duration-150 ${
+                    avatar === id
+                      ? "-translate-y-0.5 border-emerald-400 bg-emerald-400/15 shadow-[0_0_16px_rgba(52,211,153,0.45)]"
+                      : "border-white/10 bg-white/5 hover:-translate-y-0.5 hover:border-white/30 hover:bg-white/10"
+                  }`}
+                >
+                  <AvatarPreview id={id} size={50} />
+                </button>
+              ))}
+            </div>
+
+            <Button onClick={startGame} className={`${primaryBtn} mt-5`}>
+              Play
+              <Kbd className="ml-2 border-emerald-900/30 bg-emerald-900/15 text-emerald-950/70">Enter</Kbd>
             </Button>
-          )}
+
+            <div className="mt-4 flex items-center justify-center gap-3 text-sm">
+              {highScore > 0 ? (
+                <span className="rounded-full bg-amber-400/15 px-3 py-1 font-semibold text-amber-300">
+                  🏆 Best {highScore.toLocaleString()}
+                </span>
+              ) : (
+                <span className="text-white/45">No best yet — go set one!</span>
+              )}
+            </div>
+
+            <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-white/10 pt-4 text-left text-[13px] text-white/60">
+              <span className="flex items-center gap-1.5">
+                <Kbd>←</Kbd>
+                <Kbd>→</Kbd> Move
+              </span>
+              <span className="flex items-center gap-1.5">
+                <Kbd>Space</Kbd> Shoot up
+              </span>
+              <span className="flex items-center gap-1.5">
+                <Kbd>Click</Kbd> Aimed shot
+              </span>
+              <span className="flex items-center gap-1.5">
+                <Kbd>P</Kbd> Pause
+              </span>
+            </div>
+          </div>
         </div>
+      )}
 
-        {/* Menu */}
-        {gameState === "menu" && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/30 p-4">
-            <div className="w-full max-w-xs rounded-3xl border border-white/15 bg-[#221a52]/90 p-7 text-center text-white shadow-2xl backdrop-blur-md">
-              <div className="mb-2 text-5xl motion-safe:animate-bounce" aria-hidden>
-                👾
-              </div>
-              <h1 className="mb-1 bg-gradient-to-r from-lime-300 via-emerald-300 to-cyan-300 bg-clip-text text-5xl font-black tracking-tight text-transparent drop-shadow">
-                Monster Hop
-              </h1>
-              <p className="mb-4 text-sm font-medium text-white/60">hop through the night, little monster</p>
-
-              {/* Avatar picker */}
-              <div className="mb-4">
-                <p className="mb-2 text-[11px] font-bold uppercase tracking-widest text-white/45">
-                  Pick your monster
-                </p>
-                <div className="flex justify-center gap-1.5">
-                  {AVATAR_IDS.map((id) => (
-                    <button
-                      key={id}
-                      type="button"
-                      onClick={() => setAvatar(id)}
-                      aria-label={AVATAR_NAMES[id]}
-                      aria-pressed={avatar === id}
-                      className={`rounded-2xl border-2 p-0.5 transition-all ${
-                        avatar === id
-                          ? "scale-110 border-emerald-400 bg-white/15 shadow-[0_0_12px_rgba(52,211,153,0.5)]"
-                          : "border-white/10 bg-white/5 hover:border-white/30 hover:bg-white/10"
-                      }`}
-                    >
-                      <AvatarPreview id={id} />
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-1.5 text-sm font-bold text-emerald-300">{AVATAR_NAMES[avatar]}</p>
-              </div>
-
-              {highScore > 0 && (
-                <div className="mx-auto mb-4 inline-block rounded-full bg-amber-400/90 px-4 py-1 text-sm font-bold text-amber-950 shadow">
-                  🏆 Best: {highScore}
-                </div>
-              )}
-              <Button
-                onClick={startGame}
-                className="w-full rounded-full border-b-4 border-emerald-700 bg-emerald-500 py-6 text-xl font-bold text-white shadow-[0_0_24px_rgba(52,211,153,0.45)] transition-transform hover:scale-105 hover:bg-emerald-400"
-              >
-                Play
+      {/* Paused */}
+      {gameState === "paused" && (
+        <div className="absolute inset-0 flex items-center justify-center bg-[#0b0820]/55 p-4 backdrop-blur-sm">
+          <div className={`${card} max-w-[320px] p-7`}>
+            <h2 className="text-4xl font-bold">Paused</h2>
+            <p className="mt-1 text-white/60">
+              {(worldRef.current?.score ?? 0).toLocaleString()} pts · {ZONES[worldRef.current?.zone ?? 0].name}
+            </p>
+            <div className="mt-6 space-y-2.5">
+              <Button onClick={() => setState("playing")} className={primaryBtn}>
+                <PlayIcon className="mr-2 h-5 w-5" /> Resume
+                <Kbd className="ml-2 border-emerald-900/30 bg-emerald-900/15 text-emerald-950/70">Esc</Kbd>
               </Button>
-              <div className="mt-5 space-y-1 text-xs font-medium text-white/55">
-                <p>⬅️ ➡️ or A / D to move · wraps around edges</p>
-                <p>SPACE shoots up · tap or click to aim a shot</p>
-                <p>Springs, trampolines, shoes, propellers &amp; jetpacks</p>
-                <p>Dodge monster goo &amp; black holes! · P to pause</p>
-              </div>
+              <Button onClick={startGame} className={secondaryBtn}>
+                <RotateCcwIcon className="mr-2 h-4 w-4" /> Restart <Kbd className="ml-2">R</Kbd>
+              </Button>
+              <Button onClick={goToMenu} variant="ghost" className={`${secondaryBtn} bg-transparent text-white/60`}>
+                <HomeIcon className="mr-2 h-4 w-4" /> Main menu
+              </Button>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Paused */}
-        {gameState === "paused" && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]">
-            <div className="w-full max-w-[260px] rounded-3xl border border-white/15 bg-[#221a52]/90 p-6 text-center text-white shadow-2xl backdrop-blur-md">
-              <h2 className="mb-1 text-3xl font-black">Paused</h2>
-              <p className="mb-5 text-sm font-semibold text-white/60">Score {worldRef.current?.score ?? 0}</p>
-              <div className="space-y-2.5">
-                <Button
-                  onClick={() => setState("playing")}
-                  className="w-full rounded-full border-b-4 border-emerald-700 bg-emerald-500 py-5 font-bold text-white hover:bg-emerald-400"
-                >
-                  <PlayIcon className="mr-2 h-4 w-4" /> Resume
-                </Button>
-                <Button
-                  onClick={startGame}
-                  className="w-full rounded-full bg-white/15 py-5 font-bold text-white hover:bg-white/25"
-                >
-                  <RotateCcwIcon className="mr-2 h-4 w-4" /> Restart
-                </Button>
-                <Button
-                  onClick={goToMenu}
-                  variant="ghost"
-                  className="w-full rounded-full py-5 font-bold text-white/60 hover:bg-white/10 hover:text-white"
-                >
-                  <HomeIcon className="mr-2 h-4 w-4" /> Menu
-                </Button>
+      {/* Game over */}
+      {gameState === "gameOver" && (
+        <div className="absolute inset-0 flex items-center justify-center overflow-y-auto bg-[#0b0820]/55 p-4 backdrop-blur-sm">
+          <div className={`${card} relative max-w-[380px] overflow-hidden p-7`}>
+            {finalStats.isNewBest && (
+              <div className="absolute -right-12 top-6 rotate-45 bg-amber-400 px-12 py-1 text-xs font-bold uppercase tracking-wider text-amber-950 shadow">
+                New best!
               </div>
+            )}
+            <p className="text-sm font-semibold uppercase tracking-[0.2em] text-rose-300/80">Game over</p>
+            <h2 className="mt-1 text-2xl font-bold text-white/90">{finalStats.cause}</h2>
+            <div className="my-4 text-7xl font-bold tabular-nums text-emerald-300 drop-shadow-[0_0_24px_rgba(52,211,153,0.45)]">
+              {shownScore.toLocaleString()}
+            </div>
+            <p className="-mt-2 mb-5 text-sm text-white/50">
+              Reached <span className="font-semibold text-white/80">{ZONES[finalStats.zone].name}</span>
+            </p>
+            <div className="mb-6 grid grid-cols-2 gap-2">
+              {[
+                { label: "Height", value: `${finalStats.height.toLocaleString()} m` },
+                { label: "Best", value: highScore.toLocaleString() },
+                { label: "Monsters", value: finalStats.kills.toLocaleString() },
+                { label: "Gems", value: finalStats.gems.toLocaleString() },
+              ].map((stat) => (
+                <div key={stat.label} className="rounded-2xl bg-white/[0.07] px-3 py-2.5">
+                  <div className="text-xl font-bold tabular-nums">{stat.value}</div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-white/45">{stat.label}</div>
+                </div>
+              ))}
+            </div>
+            <div className="space-y-2.5">
+              <Button onClick={startGame} className={primaryBtn}>
+                Play again
+                <Kbd className="ml-2 border-emerald-900/30 bg-emerald-900/15 text-emerald-950/70">Enter</Kbd>
+              </Button>
+              <Button onClick={goToMenu} variant="ghost" className={`${secondaryBtn} bg-transparent text-white/60`}>
+                <HomeIcon className="mr-2 h-4 w-4" /> Main menu <Kbd className="ml-2">Esc</Kbd>
+              </Button>
             </div>
           </div>
-        )}
-
-        {/* Game over */}
-        {gameState === "gameOver" && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]">
-            <div className="w-full max-w-xs rounded-3xl border border-white/15 bg-[#221a52]/90 p-7 text-center text-white shadow-2xl backdrop-blur-md">
-              <h2 className="text-4xl font-black">Game Over!</h2>
-              {finalStats.isNewBest && (
-                <div className="mx-auto mt-3 inline-block rounded-full bg-amber-400 px-4 py-1 text-sm font-black uppercase tracking-wide text-amber-950 shadow motion-safe:animate-pulse">
-                  ★ New Best! ★
-                </div>
-              )}
-              <div className="my-5 text-6xl font-black tabular-nums text-emerald-300 drop-shadow-[0_0_18px_rgba(52,211,153,0.5)]">
-                {finalStats.score}
-              </div>
-              <div className="mb-6 grid grid-cols-2 gap-2">
-                <div className="rounded-2xl bg-white/10 p-3">
-                  <div className="text-lg font-bold">{highScore}</div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wide text-white/50">Best</div>
-                </div>
-                <div className="rounded-2xl bg-white/10 p-3">
-                  <div className="text-lg font-bold">{finalStats.kills}</div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wide text-white/50">Monsters</div>
-                </div>
-              </div>
-              <div className="space-y-2.5">
-                <Button
-                  onClick={startGame}
-                  className="w-full rounded-full border-b-4 border-emerald-700 bg-emerald-500 py-6 text-xl font-bold text-white shadow-[0_0_24px_rgba(52,211,153,0.45)] transition-transform hover:scale-105 hover:bg-emerald-400"
-                >
-                  Play Again
-                </Button>
-                <Button
-                  onClick={goToMenu}
-                  variant="ghost"
-                  className="w-full rounded-full py-5 font-bold text-white/60 hover:bg-white/10 hover:text-white"
-                >
-                  <HomeIcon className="mr-2 h-4 w-4" /> Menu
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
+        </div>
+      )}
     </main>
+  )
+}
+
+function Kbd({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return (
+    <kbd
+      className={`inline-flex min-w-[1.6rem] items-center justify-center rounded-md border border-white/20 bg-white/10 px-1.5 py-0.5 font-[inherit] text-[11px] font-semibold leading-none text-white/80 shadow-[inset_0_-2px_0_rgba(255,255,255,0.1)] ${className}`}
+    >
+      {children}
+    </kbd>
   )
 }

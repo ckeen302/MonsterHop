@@ -113,6 +113,15 @@ export function useSoundEffects() {
   }, [tone, noiseBurst])
   const playSucked = useCallback(() => tone("sawtooth", 500, 40, 0.7, 0.22), [tone])
   const playEnemyShoot = useCallback(() => tone("sawtooth", 280, 140, 0.14, 0.14), [tone])
+  const playGem = useCallback(() => {
+    tone("sine", 1320, 1320, 0.07, 0.16)
+    tone("sine", 1760, 1760, 0.1, 0.14, 0.05)
+  }, [tone])
+  const playZone = useCallback(() => {
+    tone("triangle", 523, 523, 0.22, 0.16)
+    tone("triangle", 659, 659, 0.22, 0.16, 0.12)
+    tone("triangle", 784, 784, 0.35, 0.16, 0.24)
+  }, [tone])
   const playShieldPop = useCallback(() => {
     tone("sine", 1200, 400, 0.18, 0.2)
     noiseBurst(0.08, 0.1, 2000)
@@ -142,6 +151,8 @@ export function useSoundEffects() {
     playSucked,
     playEnemyShoot,
     playShieldPop,
+    playGem,
+    playZone,
     playGameOver,
   }
 }

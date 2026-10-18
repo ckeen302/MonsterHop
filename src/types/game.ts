@@ -20,6 +20,7 @@ export interface Platform {
   attachSide: number // -1 (left end) or 1 (right end)
   sprungAt: number // when the spring was last used (animation)
   fadingAt: number // ghost platforms: when the single bounce consumed it (0 = unused)
+  landedAt: number // last time the player bounced off it (drives the dip animation)
 }
 
 export interface MonsterEntity {
@@ -66,6 +67,21 @@ export interface Shard {
   flip: boolean
 }
 
+export interface Gem {
+  id: number
+  x: number
+  y: number
+  phase: number
+}
+
+export interface Popup {
+  x: number
+  y: number
+  text: string
+  color: string
+  life: number
+}
+
 export interface Particle {
   x: number
   y: number
@@ -99,15 +115,24 @@ export interface World {
   enemyShots: EnemyShot[]
   shards: Shard[]
   particles: Particle[]
+  gems: Gem[]
+  popups: Popup[]
   time: number
   nextSpawnY: number
   lastMainX: number
   totalClimb: number
   score: number
+  bonus: number
   kills: number
+  gemsCollected: number
+  stompChain: number
+  zone: number
+  zoneBannerAt: number
   fellAt: number
   suckedAt: number
   suckX: number
   suckY: number
   shakeUntil: number
+  shakeMag: number
+  flashUntil: number
 }
